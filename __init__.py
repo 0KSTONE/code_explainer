@@ -1,9 +1,9 @@
 # explain_lines.py
-import ast, sys, json, runpy, types, argparse, io, contextlib, linecache
-from trace import Trace
+import ast, sys, json, runpy, types, argparse, io, contextlib, linecache, builtins, time
 import tkinter as tk
 from tkinter import filedialog
 import subprocess, textwrap, shutil
+from trace import Trace
 
 def browse_files():
     """
@@ -68,46 +68,91 @@ def ast_facts(src):
             items.append(f"class: {node.name}")
     return facts
 
-def run_with_trace(path, entry=None, args=None, kwargs=None):
+def run_with_trace(path, entry=None, args=None, kwargs=None, stdin_data=""):
+    """
+    Safe execution:
+      - Load file as a module with run_name="__not_main__" (skips if __name__=="__main__" blocks)
+      - Stub input() with provided stdin_data (or empty)
+      - Clamp time.sleep() to avoid long waits
+      - Trace ONLY the entry() call (not import-time code)
+    """
     args = args or []
     kwargs = kwargs or {}
-    # Prepare a module to execute the target file
-    globs = {"__name__": "__main__", "__file__": path}
-    src = read_file(path)
-    code = compile(src, path, "exec")
-    # capture stdout to avoid spam while tracing
-    stdout = io.StringIO()
-    tracer = Trace(count=True, trace=False, ignoremods=set(sys.builtin_module_names))
-    with contextlib.redirect_stdout(stdout):
-        tracer.runctx(code, globs, globs)
+
+    # 1) Import without triggering __main__ blocks
+    globs = runpy.run_path(path, run_name="__not_main__")
+
+    # 2) Build stubs
+    fake_stdin = io.StringIO(stdin_data)
+    original_input = builtins.input
+    original_sleep = time.sleep
+
+    def stub_input(prompt=None):
+        line = fake_stdin.readline()
+        return line.rstrip("\n") if line else ""
+
+    def fast_sleep(s):
+        # cap to 10ms so "waits" don't stall tracing
+        original_sleep(min(float(s), 0.01))
+
+    # 3) Trace only the entry call
+    tracer = Trace(count=True, trace=False, ignoremods=set())
+
+    out_buf = io.StringIO()
+    try:
+        builtins.input = stub_input
+        time.sleep = fast_sleep
+
         if entry:
             func = globs.get(entry)
-            if callable(func):
-                func(*args, **kwargs)
+            if not callable(func):
+                counts = {}
+                return {}, ""
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(out_buf), contextlib.redirect_stdin(fake_stdin):
+                tracer.runfunc(func, *args, **kwargs)
+        else:
+            counts = {}
+            return {}, out_buf.getvalue()
+
+    finally:
+        builtins.input = original_input
+        time.sleep = original_sleep
+
     results = tracer.results()
-    counts = results.counts  # {(filename, lineno): hits}
-    line_hits = {ln: hits for (fname, ln), hits in counts.items() if fname.endswith(path)}
-    return line_hits, stdout.getvalue()
+    counts = {ln: hits for (fname, ln), hits in results.counts.items() if fname.endswith(path)}
+    return counts, out_buf.getvalue()
 
 def explain_file(path, entry=None, args=None, kwargs=None):
     src = read_file(path)
     facts = ast_facts(src)
     hits, out = run_with_trace(path, entry, args, kwargs)
+
+    # Precompute facts and hits for faster access
+    fact_lines = set(facts.keys())
+    hit_lines = set(hits.keys())
+
     explanations = []
     lines = src.splitlines()
+
     for i, text in enumerate(lines, start=1):
-        line_info = []
-        if i in facts:      line_info += facts[i]
-        if hits.get(i, 0):  line_info += [f"runtime: executed {hits[i]}x"]
         if not text.strip():
-            continue
+            continue  # Skip blank lines early
+
+        line_info = []
+        if i in fact_lines:
+            line_info.extend(facts[i])
+        if i in hit_lines:
+            line_info.append(f"runtime: executed {hits[i]}x")
+
         if not line_info:
             line_info = ["(no AST events; likely comment/blank or simple expression)"]
+
         explanations.append({
             "line": i,
             "code": text.rstrip(),
             "facts": line_info
         })
+
     return explanations, out
 
 # ---- CONFIG ----
@@ -131,21 +176,26 @@ Now produce the JSON as specified.
 
 def call_local_llm(prompt):
     if USE_OLLAMA:
-        try:
-            # Use Ollama with a timeout to prevent hanging
-            proc = subprocess.run(
-                ["ollama", "run", MODEL],
-                input=prompt.encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30  # Timeout after 30 seconds
-            )
-            if proc.returncode != 0:
-                print("Error running Ollama:", proc.stderr.decode("utf-8"))
-                raise SystemExit("Ollama command failed. Check the error above.")
-            return proc.stdout.decode("utf-8")
-        except subprocess.TimeoutExpired:
-            raise SystemExit("Ollama command timed out. Ensure the model is available and try again.")
+        retries = 2  # Number of retries
+        for attempt in range(retries + 1):
+            try:
+                # Use Ollama with a longer timeout to prevent hanging
+                proc = subprocess.run(
+                    ["ollama", "run", MODEL],
+                    input=prompt.encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=600  # Timeout after 60 seconds
+                )
+                if proc.returncode != 0:
+                    print("Error running Ollama:", proc.stderr.decode("utf-8"))
+                    raise RuntimeError("Ollama command failed. Check the error above.")
+                return proc.stdout.decode("utf-8")
+            except subprocess.TimeoutExpired:
+                if attempt < retries:
+                    print(f"Attempt {attempt + 1} failed due to timeout. Retrying...")
+                else:
+                    raise SystemExit("Ollama command timed out after multiple attempts. Ensure the model is available and try again.")
     else:
         raise SystemExit("No local LLM runner found (expected Ollama). Install and retry.")
 
